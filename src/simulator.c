@@ -14,23 +14,27 @@ void sim_init(Simulator *sim)
 
     motor_init(&sim->motor);
 
+    /* Default PID gains (tuned for default motor) */
     pid_init(&sim->pid, 0.5f, 2.0f, 0.001f, 0.0f, 12.0f);
     pid_set_derivative_filter(&sim->pid, 0.8f);
 
     hal_init(&sim->hal);
     hal_timer_set_period(&sim->hal, SIM_CONTROL_PERIOD);
 
-    sim->sim_duration  = 2.0f;
+    sim->sim_duration  = 2.0f;    /* 2 seconds default */
     sim->dt            = (float)SIM_DT_US / 1000000.0f;
     sim->setpoint_rpm  = 0.0f;
     sim->load_torque   = 0.0f;
 
+    /* Default step input: 500 RPM at t=0.1s */
     sim->step_time      = 0.1f;
     sim->step_value_rpm = 500.0f;
 
+    /* No load disturbance by default */
     sim->load_step_time  = -1.0f;
     sim->load_step_value = 0.0f;
 
+    /* Allocate log buffer */
     sim->log_capacity = (int)(sim->sim_duration / sim->dt) + 100;
     sim->log = (LogEntry *)malloc(sim->log_capacity * sizeof(LogEntry));
     sim->log_count = 0;
@@ -57,6 +61,7 @@ void sim_set_duration(Simulator *sim, float duration_s)
 {
     sim->sim_duration = duration_s;
 
+    /* Reallocate log buffer */
     sim->log_capacity = (int)(duration_s / sim->dt) + 100;
     free(sim->log);
     sim->log = (LogEntry *)malloc(sim->log_capacity * sizeof(LogEntry));
@@ -77,7 +82,9 @@ int sim_run(Simulator *sim)
     float current_load = 0.0f;
 
     int total_steps = (int)(sim->sim_duration / sim->dt);
-    int log_decimation = 10;
+    int log_decimation = 10;  /* Log every 10th step to keep file manageable */
+
+    PIDState prev_state = pid_get_state(&sim->pid);
 
     printf("Running simulation: %.2fs, dt=%.0fus, control@%dHz\n",
            sim->sim_duration, sim->dt * 1e6f,
@@ -95,31 +102,48 @@ int sim_run(Simulator *sim)
     for (int step = 0; step < total_steps; step++) {
         time = step * sim->dt;
 
+        /* --- Apply step input --- */
         if (time >= sim->step_time) {
             current_setpoint = sim->step_value_rpm;
         }
 
+        /* --- Apply load disturbance --- */
         if (sim->load_step_time >= 0.0f && time >= sim->load_step_time) {
             current_load = sim->load_step_value;
         }
 
+        /* --- Simulate timer interrupt (control loop) --- */
         hal_timer_tick(&sim->hal, (uint32_t)(sim->dt * 1e6f));
 
         if (hal_timer_check(&sim->hal)) {
+            /* Read motor speed (simulated ADC/encoder) */
             float measured_rpm = motor_get_rpm(&sim->motor);
 
+            /* Run PID controller */
             float control_dt = (float)SIM_CONTROL_PERIOD / 1000000.0f;
             control_voltage = pid_compute(&sim->pid, current_setpoint,
                                           measured_rpm, control_dt);
 
+            /* Detect and print state transitions */
+            PIDState cur_state = pid_get_state(&sim->pid);
+            if (cur_state != prev_state) {
+                printf("  [t=%.4fs] PID state: %s -> %s\n",
+                       time, pid_state_name(prev_state),
+                       pid_state_name(cur_state));
+                prev_state = cur_state;
+            }
+
+            /* Write PWM output */
             uint8_t duty = (uint8_t)((control_voltage / sim->motor.V_max)
                            * (HAL_PWM_RESOLUTION - 1));
             hal_pwm_write(&sim->hal, 0, duty);
         }
 
+        /* --- Update plant model --- */
         float applied_voltage = hal_pwm_get_voltage(&sim->hal, 0);
         motor_update(&sim->motor, applied_voltage, current_load, sim->dt);
 
+        /* --- Log data (decimated) --- */
         if (step % log_decimation == 0 && sim->log_count < sim->log_capacity) {
             LogEntry *entry = &sim->log[sim->log_count++];
             entry->time        = time;
@@ -130,6 +154,7 @@ int sim_run(Simulator *sim)
             entry->current     = sim->motor.current;
             entry->torque      = sim->motor.torque;
             entry->load_torque = current_load;
+            entry->pid_state   = (int)pid_get_state(&sim->pid);
         }
     }
 
@@ -145,13 +170,14 @@ int sim_export_csv(const Simulator *sim, const char *filename)
         return -1;
     }
 
-    fprintf(fp, "time,setpoint,speed_rpm,error,voltage,current,torque,load_torque\n");
+    fprintf(fp, "time,setpoint,speed_rpm,error,voltage,current,torque,load_torque,pid_state\n");
 
     for (int i = 0; i < sim->log_count; i++) {
         const LogEntry *e = &sim->log[i];
-        fprintf(fp, "%.6f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f\n",
+        fprintf(fp, "%.6f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%d\n",
                 e->time, e->setpoint, e->speed_rpm, e->error,
-                e->voltage, e->current, e->torque, e->load_torque);
+                e->voltage, e->current, e->torque, e->load_torque,
+                e->pid_state);
     }
 
     fclose(fp);
@@ -166,6 +192,7 @@ void sim_print_summary(const Simulator *sim)
         return;
     }
 
+    /* Find steady-state speed (average of last 10% of data) */
     int start_idx = (int)(sim->log_count * 0.9f);
     float ss_speed = 0.0f;
     int count = 0;
@@ -175,6 +202,7 @@ void sim_print_summary(const Simulator *sim)
     }
     ss_speed /= count;
 
+    /* Find peak speed (overshoot) */
     float peak_speed = 0.0f;
     float peak_time = 0.0f;
     for (int i = 0; i < sim->log_count; i++) {
@@ -184,6 +212,7 @@ void sim_print_summary(const Simulator *sim)
         }
     }
 
+    /* Find rise time (10% to 90% of setpoint) */
     float target = sim->step_value_rpm;
     float rise_start = -1.0f, rise_end = -1.0f;
     for (int i = 0; i < sim->log_count; i++) {
@@ -195,6 +224,7 @@ void sim_print_summary(const Simulator *sim)
         }
     }
 
+    /* Find settling time (within 2% of steady state) */
     float settle_band = 0.02f * target;
     float settle_time = sim->log[sim->log_count - 1].time;
     for (int i = sim->log_count - 1; i >= 0; i--) {
