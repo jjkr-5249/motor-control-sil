@@ -1,4 +1,5 @@
-# DC Motor PID Controller — Software-in-the-Loop Simulation
+# DC Motor PID Controller - Software-in-the-Loop Simulation
+![CI](https://github.com/jjkr-5249/motor-control-sil/actions/workflows/ci.yml/badge.svg)
 
 A pure C embedded-style project that simulates a DC motor with a PID speed controller, using a Hardware Abstraction Layer (HAL) to decouple firmware from hardware — the same architecture used in automotive and electric drive systems for testing control software before deploying to a microcontroller.
 
@@ -141,6 +142,40 @@ The simulator automatically computes and prints:
 ### Load Disturbance Rejection
 ![Load Disturbance](screenshots/sim_load.png)
 
+## State Machine
+
+The PID controller implements a four-state machine for safe operation:
+IDLE → STARTUP → RUNNING → ERROR
+↓
+IDLE (via reset)
+
+| State | Behavior |
+|-------|----------|
+| **IDLE** | Output held at zero. Transitions to STARTUP on nonzero setpoint |
+| **STARTUP** | Derivative suppressed, integral held at zero to prevent startup kick. Lasts 5 cycles |
+| **RUNNING** | Normal PID operation with anti-windup and saturation monitoring |
+| **ERROR** | Output forced to zero after sustained saturation fault. Cleared by `pid_reset()` |
+
+## Docker
+
+Build and run the simulation in a container:
+
+```bash
+docker build -t motor-control-sil .
+docker run --rm motor-control-sil
+```
+
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+![CI](https://github.com/jjkr-5249/motor-control-sil/actions/workflows/ci.yml/badge.svg)
+
+The pipeline runs on every push and pull request:
+- **Build**: Compiles the project with CMake/GCC
+- **Run**: Executes the simulation and generates output CSV
+- **Validate**: Checks steady-state accuracy (< 5% error) and correct state transitions (IDLE → STARTUP → RUNNING)
+- **Docker**: Builds and runs the containerized simulation
 ## License
 
 MIT License
