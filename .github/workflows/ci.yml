@@ -1,0 +1,67 @@
+name: CI - Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build with CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_C_COMPILER=gcc
+          make
+
+      - name: Run simulation
+        run: |
+          cd build
+          ./MotorControlSIL
+
+      - name: Validate output CSV
+        run: |
+          cd build
+          test -f output.csv || (echo "ERROR: output.csv not generated" && exit 1)
+          head -1 output.csv | grep -q "pid_state" || (echo "ERROR: missing pid_state column" && exit 1)
+          DATA_ROWS=$(tail -n +2 output.csv | wc -l)
+          echo "CSV contains $DATA_ROWS data rows"
+          test "$DATA_ROWS" -gt 100 || (echo "ERROR: too few data rows" && exit 1)
+          FINAL_SPEED=$(tail -1 output.csv | cut -d',' -f3)
+          echo "Final speed: $FINAL_SPEED RPM"
+          python3 -c "
+          speed = float('$FINAL_SPEED')
+          target = 500.0
+          error_pct = abs(speed - target) / target * 100
+          print(f'Steady-state error: {error_pct:.2f}%')
+          assert error_pct < 5.0, f'SS error {error_pct:.2f}% exceeds 5% threshold'
+          print('PASS: Steady-state accuracy OK')
+          "
+
+      - name: Validate state transitions
+        run: |
+          cd build
+          STATES=$(tail -n +2 output.csv | cut -d',' -f9 | uniq)
+          echo "State sequence: $STATES"
+          echo "$STATES" | tr -d ' ' | diff - <(echo -e "0\n1\n2") || (echo "ERROR: unexpected state sequence" && exit 1)
+          echo "PASS: State transitions OK (IDLE -> STARTUP -> RUNNING)"
+
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t motor-control-sil .
+
+      - name: Run simulation in Docker
+        run: docker run --rm motor-control-sil
